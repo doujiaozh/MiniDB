@@ -1,0 +1,9 @@
+build/
+testdata/
+*.o
+*.a
+*.exe
+*.sst
+*.wal
+MANIFEST
+MANIFEST.tmp
