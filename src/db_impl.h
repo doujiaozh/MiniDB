@@ -17,21 +17,26 @@
 
 namespace mdb {
 
+const int kMaxLevels = 4;
+
 struct Options {
   size_t memtable_size_bytes;
   size_t block_size_bytes;
   int compaction_trigger_files;
   int bloom_bits_per_key;
   bool sync_on_write;
+  size_t level_base_size_bytes;
+  int level_size_multiplier;
+  size_t target_sstable_size_bytes;
 
   Options();
 };
 
 struct Version {
-  std::vector<std::shared_ptr<SSTableReader>> files;
+  std::vector<std::vector<std::shared_ptr<SSTableReader>>> levels;
   uint64_t max_seq;
 
-  Version() : max_seq(0) {}
+  Version();
 };
 
 class DBImpl {
@@ -48,18 +53,31 @@ class DBImpl {
   int Delete(const std::string& key);
   bool Flush(std::string* error);
   bool Compact(std::string* error);
+  bool VerifyLevels(std::string* error);
+  std::string LevelsText();
   void GetStats(minidb_stats* stats);
   const char* LastError();
   void Close();
 
  private:
   bool Recover(std::string* error);
-  bool WriteManifest(const std::vector<uint64_t>& files, uint64_t max_seq, std::string* error);
-  bool LoadManifest(std::vector<uint64_t>* files, uint64_t* max_seq, bool* found,
+  bool WriteManifest(const std::vector<std::vector<uint64_t>>& levels, uint64_t max_seq,
+                     std::string* error);
+  bool LoadManifest(std::vector<std::vector<uint64_t>>* levels, uint64_t* max_seq, bool* found,
                     std::string* error);
   int WriteBatch(ValueType type, const std::string& key, const std::string& value);
-  bool MaybeCompact(std::string* error);
   void BackgroundLoop();
+  bool NeedsCompaction(std::shared_ptr<Version>* snapshot);
+  int PickLevel(const Version& version) const;
+  bool CompactLevel(int level, std::string* error);
+  bool RunMerge(const std::vector<std::shared_ptr<SSTableReader>>& inputs, int output_level,
+                uint64_t max_seq, std::vector<std::shared_ptr<SSTableReader>>* outputs,
+                std::string* error);
+  uint64_t AllocateFileNumber();
+  uint64_t LevelLimit(int level) const;
+  uint64_t LevelSize(const Version& version, int level) const;
+  int Level0Trigger() const;
+  std::vector<std::vector<uint64_t>> ManifestNumbers(const Version& version) const;
   void SetError(const std::string& message);
 
   std::string SstPath(uint64_t number) const;

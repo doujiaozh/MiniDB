@@ -25,6 +25,8 @@ class SSTableBuilder {
   void Abandon();
 
   bool ok() const { return !failed_; }
+  uint64_t CurrentSize() const;
+  uint64_t entry_count() const { return entry_count_; }
 
  private:
   bool FlushBlock();
@@ -67,7 +69,10 @@ class SSTableReader {
   uint64_t file_number() const { return file_number_; }
   uint64_t entry_count() const { return entry_count_; }
   uint64_t max_seq() const { return max_seq_; }
+  uint64_t file_size() const { return file_.size(); }
   const std::string& path() const { return path_; }
+  const std::string& smallest_key() const { return smallest_key_; }
+  const std::string& largest_key() const { return largest_key_; }
 
   class Iterator {
    public:
@@ -114,6 +119,8 @@ class SSTableReader {
   BloomFilter bloom_;
   uint64_t entry_count_;
   uint64_t max_seq_;
+  std::string smallest_key_;
+  std::string largest_key_;
 };
 
 }

@@ -206,6 +206,10 @@ void SSTableBuilder::Abandon() {
   RemoveFile(tmp_path_);
 }
 
+uint64_t SSTableBuilder::CurrentSize() const {
+  return file_ ? file_->size() : 0;
+}
+
 SSTableReader::SSTableReader()
     : file_number_(0), entry_count_(0), max_seq_(0) {}
 
@@ -257,6 +261,19 @@ bool SSTableReader::Open(const std::string& path, uint64_t file_number) {
     if (entry.size == 0 || entry.size > kMaxBlockSize) return false;
     if (entry.offset + entry.size > size - kFooterSize) return false;
     index_.push_back(std::move(entry));
+  }
+
+  if (!index_.empty()) {
+    std::string first_block;
+    if (!ReadBlock(index_[0].offset, index_[0].size, &first_block)) return false;
+    if (first_block.size() < 4) return false;
+    uint32_t first_count = DecodeFixed32(first_block.data());
+    if (first_count > 0) {
+      BlockEntry first_entry;
+      if (!ParseBlockEntry(first_block, first_count, 0, &first_entry)) return false;
+      smallest_key_.assign(first_entry.key, first_entry.key_length);
+    }
+    largest_key_ = index_.back().last_key;
   }
 
   std::string bloom_data;

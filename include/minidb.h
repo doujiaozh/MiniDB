@@ -19,6 +19,9 @@ typedef struct minidb_options {
   int compaction_trigger_files;
   size_t block_size_bytes;
   int bloom_bits_per_key;
+  size_t level_base_size_bytes;
+  int level_size_multiplier;
+  size_t target_sstable_size_bytes;
 } minidb_options;
 
 typedef struct minidb_stats {
@@ -32,6 +35,9 @@ typedef struct minidb_stats {
   unsigned long long compaction_count;
   unsigned long long get_count;
   unsigned long long put_count;
+  unsigned long long delete_count;
+  unsigned long long level_files[4];
+  unsigned long long level_bytes[4];
 } minidb_stats;
 
 void db_options_init(minidb_options* options);
@@ -42,6 +48,8 @@ void db_free_value(char* value);
 int db_delete(minidb* db, const char* key, size_t key_len);
 int db_flush(minidb* db);
 int db_compact(minidb* db);
+int db_verify_levels(minidb* db);
+int db_levels_text(minidb* db, char** text, size_t* text_len);
 void db_get_stats(minidb* db, minidb_stats* stats);
 const char* db_last_error(minidb* db);
 int db_close(minidb* db);
