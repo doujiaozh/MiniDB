@@ -7,3 +7,5 @@ testdata/
 *.wal
 MANIFEST
 MANIFEST.tmp
+__pycache__/
+*.pyc

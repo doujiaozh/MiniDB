@@ -1,6 +1,6 @@
 # MiniDB
 
-Windows 7 上从零实现的持久化键值存储引擎与 TCP 服务端，C++17 编写，对外提供 C API 与文本协议接口。
+Windows 7 上从零实现的持久化键值存储引擎与 TCP 服务端，C++17 编写，对外提供 C API，以及兼容 Redis RESP2 的网络接口。
 
 ## 目标
 
@@ -9,7 +9,8 @@ Windows 7 上从零实现的持久化键值存储引擎与 TCP 服务端，C++17
 - 内存表达到阈值后冻结并落盘为 SSTable，读取使用块索引与块内二分查找
 - 每个 SSTable 携带布隆过滤器，快速排除不存在的键
 - 分层压缩 L0 至 L3，降低写放大，L0 允许重叠，L1 以上键全局有序且不重叠
-- TCP 服务端监听 6379，工作线程池处理并发连接，文本协议支持 PUT、GET、DEL
+- TCP 服务端监听 6379，工作线程池处理并发连接，RESP2 支持 SET、GET、DEL 与 MULTI、EXEC、DISCARD 基础事务
+- 保留原有空格分隔的行内指令，旧的 PUT、GET、DEL、PUTB 调用方式继续可用
 - 提供命令行客户端与并发网络测试
 
 ## 目录结构
@@ -22,7 +23,8 @@ Windows 7 上从零实现的持久化键值存储引擎与 TCP 服务端，C++17
     src/wal.h/.cpp            预写日志
     src/sstable.h/.cpp        SSTable 构建与读取
     src/db_impl.h/.cpp        引擎核心、分层压缩、恢复、C API
-    src/server.cpp            TCP 服务端与线程池
+    src/resp.h                RESP2 编解码与增量请求解析
+    src/server.cpp            RESP 服务端、事务队列与线程池
     src/cli.cpp               命令行客户端
     src/net_client.h          Winsock 客户端与协议编解码
     tests/test_persist.cpp    崩溃恢复与压缩验证
@@ -30,9 +32,11 @@ Windows 7 上从零实现的持久化键值存储引擎与 TCP 服务端，C++17
     tests/test_concurrent.cpp 多线程读写一致性
     tests/test_levels.cpp     分层压缩、层间有序性、墓碑遮蔽
     tests/test_network.cpp    并发客户端网络读写与协议验证
+    tests/test_resp.py        redis-py 与原始 RESP 事务兼容性验证
     build.bat                 MinGW 构建脚本
     Makefile                  mingw32-make 构建脚本
     run_network_test.bat      一键启动服务端并执行网络测试
+    run_resp_test.bat         一键执行 redis-py RESP 测试
 
 ## 写入与读取路径
 
@@ -63,8 +67,10 @@ Windows 7 上从零实现的持久化键值存储引擎与 TCP 服务端，C++17
 
 - 监听 0.0.0.0:6379，主线程使用 select 轮询接受连接
 - 固定大小工作线程池，每个连接由工作线程处理到 EOF，网络读写与引擎并发控制相互独立
+- 增量 RESP2 解析器支持数组请求与行内请求，支持流水线与半包重组
 - 服务端直接调用 C API，写操作由引擎内部的写互斥量串行化，读操作持有版本快照
-- 连接级接收发送超时 120 秒，单行上限 1MB，批量值上限 64MB
+- 服务端读写锁保证 EXEC 期间不与其它连接的数据指令交错
+- 连接级接收发送超时 120 秒，行内请求上限 1MB，单个批量值上限 64MB，挂起缓冲上限 256MB
 
 启动：
 
@@ -75,23 +81,60 @@ Windows 7 上从零实现的持久化键值存储引擎与 TCP 服务端，C++17
 
 ## 协议
 
-请求以 CRLF 结尾，响应采用整数、简单字符串、批量字符串或错误四种形式。
+服务端兼容 Redis RESP2。标准客户端发送数组请求，响应使用简单字符串 +、错误 -、整数 :、批量字符串 $ 与数组 *。
 
-    PUT key value                  +OK
-    PUTB klen vlen CRLF key value  +OK
+请求示例：
+
+    *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+
+基础指令：
+
+    PING [message]                 +PONG 或批量回显
+    ECHO message                   $len CRLF message CRLF
+    SET key value [NX|XX] [GET]    +OK，条件不满足返回 $-1，GET 返回旧值
     GET key                        $len CRLF value CRLF，缺失返回 $-1
-    DEL key                        :1
-    PING                           +PONG
+    DEL key [key ...]              :删除的键数量
+    EXISTS key [key ...]           :存在的键数量
+    MGET key [key ...]             *N，逐项批量字符串或空值
+    MSET key value [key value ...] +OK
+    TYPE key                       +string 或 +none
+    SELECT 0                       +OK
+    CLIENT SETINFO|SETNAME|GETNAME|ID|INFO  连接元数据
+    COMMAND [subcommand]           *0
+    INFO [section]                 $len CRLF 统计文本 CRLF
     STATS                          $len CRLF 键值统计文本 CRLF
     LEVELS                         $len CRLF 每行层级、文件号、条目数、最小键十六进制、最大键十六进制
     CHECK                          +OK 表示各层有序且不重叠
     FLUSH                          +OK
     COMPACT                        +OK，全量压缩到最底层
+    QUIT                           +OK 并关闭连接
     SHUTDOWN                       +OK 并停止服务
 
-PUT 的键值不能包含空格，二进制安全的写入使用 PUTB。
+事务指令：
 
-命令行客户端：
+    MULTI                          +OK，开启连接级事务队列
+    EXEC                           *N，按序返回队列中每个指令的响应
+    DISCARD                        +OK，清空事务队列
+
+行内兼容形式：
+
+    PUT key value                  +OK
+    PUTB klen vlen CRLF key value  +OK
+    GET key                        $len CRLF value CRLF，缺失返回 $-1
+    DEL key                        :1
+
+行内形式的键值不能包含空格，二进制安全的写入使用 PUTB 或 RESP 批量字符串。
+
+## 事务
+
+- MULTI 之后的数据指令不立即执行，统一返回 +QUEUED
+- EXEC 在服务端全局排他锁内按队列顺序执行，响应为与队列等长的数组，执行期间其它连接无法穿插
+- DISCARD 丢弃整个队列并退出事务状态
+- 队列阶段遇到未知指令或参数错误时记录事务脏标记，EXEC 返回 -EXECABORT 并丢弃队列
+- 嵌套 MULTI 返回错误但不脏化事务；未开启事务时 EXEC 与 DISCARD 返回错误
+- 事务只提供隔离与按序执行，不支持回滚与 WATCH 条件事务，WAL 仍按单条指令追加
+
+## 命令行客户端
 
     build\minidb_cli.exe -h 127.0.0.1 -p 6379 PUT key value
     build\minidb_cli.exe -h 127.0.0.1 -p 6379 GET key
@@ -117,8 +160,11 @@ PUT 的键值不能包含空格，二进制安全的写入使用 PUTB。
     build\test_bench.exe 64
     build\test_concurrent.exe
     run_network_test.bat
+    run_resp_test.bat
 
 网络测试脚本会以分层压力配置启动服务端，等待就绪后执行 16 个并发客户端共 10000 次混合读写，结束时发送 SHUTDOWN。
+
+RESP 测试脚本自行选择空闲端口、启动服务端、执行 redis-py 与原始 RESP 校验，并在验证重启持久化后关闭服务端。
 
 ## 验证结果
 
@@ -135,10 +181,20 @@ PUT 的键值不能包含空格，二进制安全的写入使用 PUTB。
 
 - 写入 7077 次、读取 1944 次、删除 979 次，零客户端失败，零数据不一致
 - 网络校验 2000 个键全部匹配参考模型，其中 1700 个存活、300 个已删除
-- 服务端层级统计为 L0 0 至 1 个、L1 1 个，压缩计数 2，CHECK 返回 OK
-- 协议校验通过：缺失键返回空值、未知指令返回错误、参数错误返回错误、PING 正常、STATS 含层级字段、LEVELS 层内有序、PUTB 二进制值往返一致
-- 吞吐 1531 至 6609 ops/s，受刷盘与压缩同步影响
+- 服务端层级统计为 L0 2 个、L1 1 个，压缩计数 4，CHECK 返回 OK
+- 协议校验通过：缺失键返回空值、未知指令返回错误、参数错误返回错误、PING 正常、STATS 含层级字段、LEVELS 层内有序、RESP 批量字符串二进制值往返一致
+- 吞吐 2962 ops/s，受刷盘与压缩同步影响
 - 1MB 内存表配置下同一负载吞吐 23848 ops/s
+
+RESP 与事务（python redis-py 8.2.0，独立空闲端口，全部校验通过）：
+
+- redis-py 连接成功，PING、SET、GET、DEL、EXISTS、MSET、MGET、TYPE、SET NX/XX/GET 全部符合 Redis 语义
+- 含空字节与 CRLF 的二进制键值、空值经 RESP 批量字符串往返一致
+- redis-py 流水线事务返回 [True, True, "1"]，原始 RESP 的 MULTI/EXEC 返回 [OK, alpha, 0]
+- DISCARD 丢弃队列，未开启事务的 EXEC/DISCARD 报错，未知指令使 EXEC 返回 EXECABORT，嵌套 MULTI 报错且不脏化事务
+- 流水线、半包与行内兼容指令解析正确，旧 PUT/GET/PUTB 调用方式继续可用
+- 100 个事务执行期间并发读线程零撕裂读，事务写入对外原子可见
+- SHUTDOWN 退出码 0，重启后事务写入、空值与隔离测试的最终值完整恢复
 
 网络持久化：
 
@@ -174,12 +230,13 @@ PUT 的键值不能包含空格，二进制安全的写入使用 PUTB。
 
 - 原子性：单键写入是一个 WAL 记录，恢复时整条记录校验通过才生效，截断的尾部记录被丢弃
 - 一致性：序号决定版本顺序，压缩只保留最新版本，墓碑仅在底层丢弃
-- 隔离性：读取持有版本快照，冻结内存表与 SSTable 在引用释放前不会被回收
+- 隔离性：读取持有版本快照，冻结内存表与 SSTable 在引用释放前不会被回收；EXEC 持有服务端排他锁，事务内多条指令对外表现为不可分割的执行序列
 - 持久性：WAL 记录逐条写入操作系统；开启 sync_on_write 后每次写入调用 FlushFileBuffers；SSTable 与清单在发布前执行同步
 
 ## 边界
 
 - 单进程写，写操作由进程内互斥量串行化
 - 压缩为逐层归并，未实现并发压缩与增量优先级调度
-- 未实现快照读、多版本事务与主从复制
-- 键与值以字节串处理，允许二进制内容，网络内联指令不支持含空格的键值
+- 事务支持 MULTI、EXEC、DISCARD，不实现 WATCH、回滚与 RESP3
+- 未实现键过期（SET EX/PX）、SCAN 与主从复制
+- 键与值以字节串处理，允许二进制内容，网络行内指令不支持含空格的键值，网络层拒绝空键

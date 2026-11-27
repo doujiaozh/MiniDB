@@ -11,29 +11,19 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "minidb.h"
+#include "resp.h"
 
 namespace {
 
-const size_t kMaxLineBytes = 1024 * 1024;
-const size_t kMaxBulkBytes = 64u * 1024u * 1024u;
-const size_t kMaxPendingBytes = 128u * 1024u * 1024u;
-
-std::string ToText(unsigned long long value) {
-  char buffer[32];
-  int length = 0;
-  do {
-    buffer[length++] = static_cast<char>('0' + value % 10);
-    value /= 10;
-  } while (value > 0);
-  std::string result;
-  while (length > 0) result.push_back(buffer[--length]);
-  return result;
-}
+const size_t kMaxPendingBytes = resp::kMaxPendingBytes;
+const size_t kMaxQueuedCommands = 1024u * 1024u;
+const size_t kMaxLegacyLineBytes = 1024u * 1024u;
 
 bool ParseUnsigned(const std::string& text, uint64_t* value) {
   if (text.empty()) return false;
@@ -41,7 +31,9 @@ bool ParseUnsigned(const std::string& text, uint64_t* value) {
   for (size_t i = 0; i < text.size(); ++i) {
     char c = text[i];
     if (c < '0' || c > '9') return false;
-    result = result * 10 + static_cast<uint64_t>(c - '0');
+    uint64_t digit = static_cast<uint64_t>(c - '0');
+    if (result > (0xffffffffffffffffULL - digit) / 10) return false;
+    result = result * 10 + digit;
   }
   *value = result;
   return true;
@@ -55,14 +47,6 @@ void SplitSpaces(const std::string& line, std::vector<std::string>* tokens) {
     while (position < line.size() && line[position] != ' ') ++position;
     if (position > start) tokens->push_back(line.substr(start, position - start));
   }
-}
-
-std::string Bulk(const std::string& data) {
-  return "$" + ToText(data.size()) + "\r\n" + data + "\r\n";
-}
-
-std::string Error(const std::string& message) {
-  return "-ERR " + message + "\r\n";
 }
 
 struct Config {
@@ -102,10 +86,68 @@ bool SendAll(SOCKET socket, const char* data, size_t size) {
   return true;
 }
 
+enum LegacyStatus {
+  kLegacyNone,
+  kLegacyComplete,
+  kLegacyIncomplete,
+  kLegacyError
+};
+
+LegacyStatus ParseLegacyPutb(const std::string& buffer, std::vector<std::string>* args,
+                             size_t* consumed, std::string* error) {
+  if (buffer.size() < 5) {
+    if (std::string("PUTB ").compare(0, buffer.size(), buffer) == 0) return kLegacyIncomplete;
+    return kLegacyNone;
+  }
+  if (buffer.compare(0, 5, "PUTB ") != 0) return kLegacyNone;
+  size_t line_end = buffer.find("\r\n");
+  if (line_end == std::string::npos) {
+    if (buffer.size() > kMaxLegacyLineBytes) {
+      *error = "line too long";
+      return kLegacyError;
+    }
+    return kLegacyIncomplete;
+  }
+  std::vector<std::string> tokens;
+  SplitSpaces(buffer.substr(0, line_end), &tokens);
+  uint64_t key_length = 0;
+  uint64_t value_length = 0;
+  if (tokens.size() != 3 || !ParseUnsigned(tokens[1], &key_length) ||
+      !ParseUnsigned(tokens[2], &value_length)) {
+    *error = "syntax error";
+    return kLegacyError;
+  }
+  if (key_length == 0 || key_length > resp::kMaxBulkBytes ||
+      value_length > resp::kMaxBulkBytes) {
+    *error = "invalid bulk length";
+    return kLegacyError;
+  }
+  size_t body = line_end + 2;
+  size_t key_size = static_cast<size_t>(key_length);
+  size_t value_size = static_cast<size_t>(value_length);
+  size_t needed = body + key_size + value_size + 2;
+  if (buffer.size() < needed) return kLegacyIncomplete;
+  if (buffer.compare(body + key_size + value_size, 2, "\r\n") != 0) {
+    *error = "missing bulk terminator";
+    return kLegacyError;
+  }
+  args->clear();
+  args->push_back("SET");
+  args->push_back(buffer.substr(body, key_size));
+  args->push_back(buffer.substr(body + key_size, value_size));
+  *consumed = needed;
+  return kLegacyComplete;
+}
+
 class Server {
  public:
-  Server() : db_(nullptr), listener_(INVALID_SOCKET), stopping_(false),
-             shutdown_requested_(false) {}
+  Server()
+      : db_(nullptr),
+        listener_(INVALID_SOCKET),
+        stopping_(false),
+        shutdown_requested_(false),
+        next_client_id_(0),
+        connected_clients_(0) {}
 
   ~Server() {
     StopWorkers();
@@ -157,7 +199,8 @@ class Server {
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons(static_cast<unsigned short>(config_.port));
     if (bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-      if (error != nullptr) *error = "cannot bind port " + ToText(config_.port);
+      if (error != nullptr) *error = "cannot bind port " + resp::ToText(
+                                                    static_cast<unsigned long long>(config_.port));
       return false;
     }
     if (listen(listener_, 128) != 0) {
@@ -191,6 +234,16 @@ class Server {
   }
 
  private:
+  struct ClientState {
+    ClientState() : in_multi(false), multi_error(false), id(0) {}
+
+    bool in_multi;
+    bool multi_error;
+    std::vector<std::vector<std::string>> queue;
+    std::string name;
+    unsigned long long id;
+  };
+
   void AcceptLoop() {
     while (!shutdown_requested_.load()) {
       fd_set read_set;
@@ -256,6 +309,9 @@ class Server {
   }
 
   void HandleClient(SOCKET client) {
+    ClientState state;
+    state.id = next_client_id_.fetch_add(1) + 1;
+    connected_clients_.fetch_add(1);
     std::string pending;
     char chunk[16384];
     for (;;) {
@@ -263,172 +319,440 @@ class Server {
       if (received <= 0) break;
       pending.append(chunk, static_cast<size_t>(received));
       if (pending.size() > kMaxPendingBytes) {
-        std::string response = Error("request too large");
+        std::string response = resp::Error("request too large");
         SendAll(client, response.data(), response.size());
         break;
       }
       bool close_after = false;
-      if (!ProcessBuffer(client, &pending, &close_after)) break;
+      if (!ProcessBuffer(client, &pending, &state, &close_after)) break;
       if (close_after) break;
     }
+    connected_clients_.fetch_sub(1);
   }
 
-  bool ProcessBuffer(SOCKET client, std::string* pending, bool* close_after) {
+  bool ProcessBuffer(SOCKET client, std::string* pending, ClientState* state,
+                     bool* close_after) {
     for (;;) {
-      size_t position = pending->find("\r\n");
-      if (position == std::string::npos) {
-        if (pending->size() > kMaxLineBytes) {
-          std::string response = Error("line too long");
+      if (pending->empty()) return true;
+      std::vector<std::string> args;
+      size_t consumed = 0;
+      std::string parse_error;
+      LegacyStatus legacy = ParseLegacyPutb(*pending, &args, &consumed, &parse_error);
+      if (legacy == kLegacyError) {
+        std::string response = resp::Error(parse_error);
+        SendAll(client, response.data(), response.size());
+        return false;
+      }
+      if (legacy == kLegacyIncomplete) return true;
+      if (legacy == kLegacyNone) {
+        resp::ParseStatus status = resp::ParseRequest(*pending, &args, &consumed, &parse_error);
+        if (status == resp::kIncomplete) return true;
+        if (status == resp::kError) {
+          std::string response = resp::Error("Protocol error: " + parse_error);
           SendAll(client, response.data(), response.size());
           return false;
         }
-        return true;
       }
-      std::string line = pending->substr(0, position);
-      std::vector<std::string> tokens;
-      SplitSpaces(line, &tokens);
-      if (tokens.empty()) {
-        pending->erase(0, position + 2);
-        continue;
-      }
+      pending->erase(0, consumed);
+      if (args.empty()) continue;
 
-      if (tokens[0] == "PUTB") {
-        uint64_t key_length = 0;
-        uint64_t value_length = 0;
-        if (tokens.size() != 3 || !ParseUnsigned(tokens[1], &key_length) ||
-            !ParseUnsigned(tokens[2], &value_length)) {
-          pending->erase(0, position + 2);
-          std::string response = Error("syntax error");
-          if (!SendAll(client, response.data(), response.size())) return false;
-          continue;
-        }
-        if (key_length == 0 || key_length > kMaxBulkBytes || value_length > kMaxBulkBytes) {
-          pending->erase(0, position + 2);
-          std::string response = Error("invalid bulk length");
-          if (!SendAll(client, response.data(), response.size())) return false;
-          continue;
-        }
-        size_t body = position + 2;
-        size_t needed = body + static_cast<size_t>(key_length + value_length) + 2;
-        if (pending->size() < needed) return true;
-        if (pending->compare(needed - 2, 2, "\r\n") != 0) {
-          pending->erase(0, needed);
-          std::string response = Error("missing bulk terminator");
-          if (!SendAll(client, response.data(), response.size())) return false;
-          continue;
-        }
-        std::string key = pending->substr(body, static_cast<size_t>(key_length));
-        std::string value = pending->substr(body + key_length, static_cast<size_t>(value_length));
-        pending->erase(0, needed);
-        int status = db_put(db_, key.data(), key.size(), value.data(), value.size());
-        std::string response = status == DB_OK ? "+OK\r\n" : Error("put failed");
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      pending->erase(0, position + 2);
-      const std::string& command = tokens[0];
-
-      if (command == "PUT") {
-        if (tokens.size() != 3) {
-          std::string response = Error("wrong number of arguments");
-          if (!SendAll(client, response.data(), response.size())) return false;
-          continue;
-        }
-        int status = db_put(db_, tokens[1].data(), tokens[1].size(), tokens[2].data(),
-                            tokens[2].size());
-        std::string response = status == DB_OK ? "+OK\r\n" : Error("put failed");
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "GET") {
-        if (tokens.size() != 2) {
-          std::string response = Error("wrong number of arguments");
-          if (!SendAll(client, response.data(), response.size())) return false;
-          continue;
-        }
-        char* value = nullptr;
-        size_t length = 0;
-        int status = db_get(db_, tokens[1].data(), tokens[1].size(), &value, &length);
-        std::string response;
-        if (status == DB_OK) {
-          response = Bulk(std::string(value, length));
-        } else {
-          response = "$-1\r\n";
-        }
-        if (value != nullptr) db_free_value(value);
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "DEL") {
-        if (tokens.size() != 2) {
-          std::string response = Error("wrong number of arguments");
-          if (!SendAll(client, response.data(), response.size())) return false;
-          continue;
-        }
-        int status = db_delete(db_, tokens[1].data(), tokens[1].size());
-        std::string response = status == DB_OK ? ":1\r\n" : Error("delete failed");
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "PING") {
-        const char* response = "+PONG\r\n";
-        if (!SendAll(client, response, std::strlen(response))) return false;
-        continue;
-      }
-
-      if (command == "STATS") {
-        std::string response = Bulk(StatsText());
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "LEVELS") {
-        char* text = nullptr;
-        size_t length = 0;
-        std::string body;
-        if (db_levels_text(db_, &text, &length) == DB_OK) {
-          body.assign(text, length);
-          db_free_value(text);
-        }
-        std::string response = Bulk(body);
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "CHECK") {
-        std::string response = db_verify_levels(db_) == DB_OK ? "+OK\r\n"
-                                                              : Error("levels inconsistent");
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "FLUSH") {
-        std::string response = db_flush(db_) == DB_OK ? "+OK\r\n" : Error("flush failed");
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "COMPACT") {
-        std::string response = db_compact(db_) == DB_OK ? "+OK\r\n" : Error("compaction failed");
-        if (!SendAll(client, response.data(), response.size())) return false;
-        continue;
-      }
-
-      if (command == "SHUTDOWN") {
-        const char* response = "+OK\r\n";
-        SendAll(client, response, std::strlen(response));
-        shutdown_requested_.store(true);
+      std::string response;
+      bool request_close = false;
+      ExecuteCommand(args, state, &response, &request_close);
+      if (!response.empty() && !SendAll(client, response.data(), response.size())) return false;
+      if (request_close) {
         *close_after = true;
         return true;
       }
-
-      std::string response = Error("unknown command");
-      if (!SendAll(client, response.data(), response.size())) return false;
     }
+  }
+
+  static bool IsWriteCommand(const std::string& name) {
+    return name == "SET" || name == "PUT" || name == "DEL" || name == "MSET" ||
+           name == "FLUSH" || name == "COMPACT";
+  }
+
+  static bool ValidateCommand(const std::vector<std::string>& args, std::string* error) {
+    const std::string name = resp::ToUpper(args[0]);
+    const size_t argc = args.size();
+    bool valid = false;
+    if (name == "PING") {
+      valid = argc == 1 || argc == 2;
+    } else if (name == "ECHO") {
+      valid = argc == 2;
+    } else if (name == "SET") {
+      valid = argc >= 3;
+    } else if (name == "PUT") {
+      valid = argc == 3;
+    } else if (name == "GET" || name == "TYPE") {
+      valid = argc == 2;
+    } else if (name == "DEL" || name == "EXISTS" || name == "MGET") {
+      valid = argc >= 2;
+    } else if (name == "MSET") {
+      valid = argc >= 3 && (argc % 2) == 1;
+    } else if (name == "MULTI" || name == "EXEC" || name == "DISCARD" || name == "QUIT" ||
+               name == "SHUTDOWN" || name == "UNWATCH" || name == "FLUSH" ||
+               name == "COMPACT" || name == "CHECK" || name == "STATS" ||
+               name == "LEVELS") {
+      valid = argc == 1;
+    } else if (name == "WATCH") {
+      valid = argc >= 2;
+    } else if (name == "CLIENT") {
+      valid = argc >= 2;
+    } else if (name == "COMMAND") {
+      valid = true;
+    } else if (name == "INFO") {
+      valid = argc <= 2;
+    } else if (name == "SELECT") {
+      valid = argc == 2;
+    } else if (name == "AUTH") {
+      valid = argc >= 2;
+    } else {
+      *error = "unknown command '" + resp::Printable(resp::ToLower(args[0]), 64) + "'";
+      return false;
+    }
+    if (!valid) {
+      *error = "wrong number of arguments for '" +
+               resp::Printable(resp::ToLower(args[0]), 64) + "' command";
+      return false;
+    }
+    return true;
+  }
+
+  void ExecuteCommand(const std::vector<std::string>& args, ClientState* state,
+                      std::string* response, bool* close_after) {
+    *close_after = false;
+    const std::string name = resp::ToUpper(args[0]);
+
+    if (state->in_multi) {
+      std::string validation_error;
+      if (!ValidateCommand(args, &validation_error)) {
+        state->multi_error = true;
+        *response = resp::Error(validation_error);
+        return;
+      }
+      ExecuteQueued(args, name, state, response);
+      return;
+    }
+
+    std::string validation_error;
+    if (!ValidateCommand(args, &validation_error)) {
+      *response = resp::Error(validation_error);
+      return;
+    }
+
+    if (name == "MULTI") {
+      state->in_multi = true;
+      state->multi_error = false;
+      state->queue.clear();
+      *response = resp::Simple("OK");
+      return;
+    }
+    if (name == "EXEC") {
+      *response = resp::Error("EXEC without MULTI");
+      return;
+    }
+    if (name == "DISCARD") {
+      *response = resp::Error("DISCARD without MULTI");
+      return;
+    }
+    if (name == "WATCH" || name == "UNWATCH") {
+      *response = resp::Error("WATCH is not supported");
+      return;
+    }
+
+    if (IsWriteCommand(name)) {
+      std::unique_lock<std::shared_mutex> lock(gate_);
+      *response = Dispatch(args, state, close_after);
+    } else {
+      std::shared_lock<std::shared_mutex> lock(gate_);
+      *response = Dispatch(args, state, close_after);
+    }
+  }
+
+  void ExecuteQueued(const std::vector<std::string>& args, const std::string& name,
+                     ClientState* state, std::string* response) {
+    if (name == "MULTI") {
+      *response = resp::Error("MULTI calls can not be nested");
+      return;
+    }
+    if (name == "EXEC") {
+      RunTransaction(state, response);
+      return;
+    }
+    if (name == "DISCARD") {
+      state->in_multi = false;
+      state->multi_error = false;
+      state->queue.clear();
+      *response = resp::Simple("OK");
+      return;
+    }
+    if (name == "WATCH" || name == "UNWATCH") {
+      state->multi_error = true;
+      *response = resp::Error("WATCH is not supported");
+      return;
+    }
+    if (name == "SHUTDOWN" || name == "QUIT") {
+      state->multi_error = true;
+      *response = resp::Error("command is not allowed in transactions");
+      return;
+    }
+    if (state->queue.size() >= kMaxQueuedCommands) {
+      state->multi_error = true;
+      *response = resp::Error("transaction queue overflow");
+      return;
+    }
+    state->queue.push_back(args);
+    *response = resp::Simple("QUEUED");
+  }
+
+  void RunTransaction(ClientState* state, std::string* response) {
+    const bool dirty = state->multi_error;
+    std::vector<std::vector<std::string>> queue;
+    queue.swap(state->queue);
+    state->in_multi = false;
+    state->multi_error = false;
+    if (dirty) {
+      *response = resp::PrefixedError("EXECABORT",
+                                      "Transaction discarded because of previous errors.");
+      return;
+    }
+    std::unique_lock<std::shared_mutex> lock(gate_);
+    std::string output = resp::ArrayHeader(queue.size());
+    for (size_t i = 0; i < queue.size(); ++i) {
+      bool close_after = false;
+      output.append(Dispatch(queue[i], state, &close_after));
+    }
+    *response = output;
+  }
+
+  bool Lookup(const std::string& key, std::string* value) {
+    char* raw = nullptr;
+    size_t length = 0;
+    int status = db_get(db_, key.data(), key.size(), &raw, &length);
+    if (status == DB_OK) {
+      value->assign(raw, length);
+      db_free_value(raw);
+      return true;
+    }
+    if (raw != nullptr) db_free_value(raw);
+    return false;
+  }
+
+  std::string CommandSet(const std::vector<std::string>& args) {
+    if (args[1].empty()) return resp::Error("key must not be empty");
+    bool nx = false;
+    bool xx = false;
+    bool get = false;
+    for (size_t i = 3; i < args.size(); ++i) {
+      const std::string option = resp::ToUpper(args[i]);
+      if (option == "NX") {
+        nx = true;
+      } else if (option == "XX") {
+        xx = true;
+      } else if (option == "GET") {
+        get = true;
+      } else {
+        return resp::Error("syntax error");
+      }
+    }
+    if (nx && xx) return resp::Error("syntax error");
+    std::string previous;
+    const bool existed = Lookup(args[1], &previous);
+    const std::string previous_reply = existed ? resp::Bulk(previous) : resp::NullBulk();
+    if ((nx && existed) || (xx && !existed)) return get ? previous_reply : resp::NullBulk();
+    if (db_put(db_, args[1].data(), args[1].size(), args[2].data(), args[2].size()) != DB_OK) {
+      return resp::Error("set failed");
+    }
+    return get ? previous_reply : resp::Simple("OK");
+  }
+
+  std::string CommandGet(const std::vector<std::string>& args) {
+    std::string value;
+    if (!Lookup(args[1], &value)) return resp::NullBulk();
+    return resp::Bulk(value);
+  }
+
+  std::string CommandDel(const std::vector<std::string>& args) {
+    long long removed = 0;
+    for (size_t i = 1; i < args.size(); ++i) {
+      std::string ignored;
+      if (!Lookup(args[i], &ignored)) continue;
+      if (db_delete(db_, args[i].data(), args[i].size()) != DB_OK) {
+        return resp::Error("del failed");
+      }
+      ++removed;
+    }
+    return resp::Integer(removed);
+  }
+
+  std::string CommandExists(const std::vector<std::string>& args) {
+    long long count = 0;
+    for (size_t i = 1; i < args.size(); ++i) {
+      std::string ignored;
+      if (Lookup(args[i], &ignored)) ++count;
+    }
+    return resp::Integer(count);
+  }
+
+  std::string CommandMget(const std::vector<std::string>& args) {
+    std::string output = resp::ArrayHeader(args.size() - 1);
+    for (size_t i = 1; i < args.size(); ++i) {
+      std::string value;
+      if (Lookup(args[i], &value)) {
+        output.append(resp::Bulk(value));
+      } else {
+        output.append(resp::NullBulk());
+      }
+    }
+    return output;
+  }
+
+  std::string CommandMset(const std::vector<std::string>& args) {
+    for (size_t i = 1; i < args.size(); i += 2) {
+      if (args[i].empty()) return resp::Error("key must not be empty");
+    }
+    for (size_t i = 1; i < args.size(); i += 2) {
+      if (db_put(db_, args[i].data(), args[i].size(), args[i + 1].data(),
+                 args[i + 1].size()) != DB_OK) {
+        return resp::Error("mset failed");
+      }
+    }
+    return resp::Simple("OK");
+  }
+
+  std::string CommandType(const std::vector<std::string>& args) {
+    std::string ignored;
+    return resp::Simple(Lookup(args[1], &ignored) ? "string" : "none");
+  }
+
+  std::string CommandClient(const std::vector<std::string>& args, ClientState* state) {
+    const std::string subcommand = resp::ToUpper(args[1]);
+    if (subcommand == "SETINFO") {
+      return resp::Simple("OK");
+    }
+    if (subcommand == "SETNAME") {
+      if (args.size() != 3) {
+        return resp::Error("wrong number of arguments for 'client|setname' command");
+      }
+      state->name = args[2];
+      return resp::Simple("OK");
+    }
+    if (subcommand == "GETNAME") {
+      if (args.size() != 2) {
+        return resp::Error("wrong number of arguments for 'client|getname' command");
+      }
+      return resp::Bulk(state->name);
+    }
+    if (subcommand == "ID") {
+      if (args.size() != 2) {
+        return resp::Error("wrong number of arguments for 'client|id' command");
+      }
+      return resp::Integer(static_cast<long long>(state->id));
+    }
+    if (subcommand == "INFO") {
+      if (args.size() != 2) {
+        return resp::Error("wrong number of arguments for 'client|info' command");
+      }
+      std::string info = "id=" + resp::ToText(state->id);
+      info.append(" name=").append(state->name);
+      return resp::Bulk(info);
+    }
+    return resp::Error("unknown subcommand '" + resp::Printable(resp::ToLower(args[1]), 64) +
+                       "'");
+  }
+
+  std::string CommandStats() {
+    return resp::Bulk(StatsText());
+  }
+
+  std::string CommandLevels() {
+    char* text = nullptr;
+    size_t length = 0;
+    std::string body;
+    if (db_levels_text(db_, &text, &length) == DB_OK) {
+      body.assign(text, length);
+      db_free_value(text);
+    }
+    return resp::Bulk(body);
+  }
+
+  std::string CommandInfo() {
+    std::string text;
+    text.append("# Server\r\n");
+    text.append("redis_version:6.2.0\r\n");
+    text.append("redis_mode:standalone\r\n");
+    text.append("minidb_version:0.3.0\r\n");
+    text.append("# Clients\r\n");
+    text.append("connected_clients:").append(
+        resp::ToText(static_cast<unsigned long long>(connected_clients_.load()))).append("\r\n");
+    text.append("# Replication\r\n");
+    text.append("role:master\r\n");
+    text.append("connected_slaves:0\r\n");
+    text.append("# Cluster\r\n");
+    text.append("cluster_enabled:0\r\n");
+    return resp::Bulk(text);
+  }
+
+  std::string Dispatch(const std::vector<std::string>& args, ClientState* state,
+                       bool* close_after) {
+    const std::string name = resp::ToUpper(args[0]);
+    if (name == "PING") {
+      if (args.size() == 1) return resp::Simple("PONG");
+      return resp::Bulk(args[1]);
+    }
+    if (name == "ECHO") return resp::Bulk(args[1]);
+    if (name == "SET") return CommandSet(args);
+    if (name == "PUT") {
+      std::vector<std::string> mapped;
+      mapped.push_back("SET");
+      mapped.push_back(args[1]);
+      mapped.push_back(args[2]);
+      return CommandSet(mapped);
+    }
+    if (name == "GET") return CommandGet(args);
+    if (name == "DEL") return CommandDel(args);
+    if (name == "EXISTS") return CommandExists(args);
+    if (name == "MGET") return CommandMget(args);
+    if (name == "MSET") return CommandMset(args);
+    if (name == "TYPE") return CommandType(args);
+    if (name == "CLIENT") return CommandClient(args, state);
+    if (name == "COMMAND") {
+      if (args.size() == 2 && resp::ToUpper(args[1]) == "COUNT") return resp::Integer(0);
+      return resp::ArrayHeader(0);
+    }
+    if (name == "INFO") return CommandInfo();
+    if (name == "SELECT") {
+      long long index = 0;
+      if (!resp::ParseSigned(args[1], &index)) return resp::Error("invalid DB index");
+      if (index != 0) return resp::Error("DB index is out of range");
+      return resp::Simple("OK");
+    }
+    if (name == "AUTH") {
+      return resp::Error("Client sent AUTH, but no password is set");
+    }
+    if (name == "STATS") return CommandStats();
+    if (name == "LEVELS") return CommandLevels();
+    if (name == "CHECK") {
+      return db_verify_levels(db_) == DB_OK ? resp::Simple("OK")
+                                            : resp::Error("levels inconsistent");
+    }
+    if (name == "FLUSH") {
+      return db_flush(db_) == DB_OK ? resp::Simple("OK") : resp::Error("flush failed");
+    }
+    if (name == "COMPACT") {
+      return db_compact(db_) == DB_OK ? resp::Simple("OK") : resp::Error("compaction failed");
+    }
+    if (name == "QUIT") {
+      *close_after = true;
+      return resp::Simple("OK");
+    }
+    if (name == "SHUTDOWN") {
+      shutdown_requested_.store(true);
+      *close_after = true;
+      return resp::Simple("OK");
+    }
+    return resp::Error("unknown command '" + resp::Printable(resp::ToLower(args[0]), 64) + "'");
   }
 
   std::string StatsText() {
@@ -436,22 +760,22 @@ class Server {
     std::memset(&stats, 0, sizeof(stats));
     db_get_stats(db_, &stats);
     std::string output;
-    output.append("memtable_entries=").append(ToText(stats.memtable_entries)).append("\n");
-    output.append("immutable_entries=").append(ToText(stats.immutable_entries)).append("\n");
-    output.append("sstable_files=").append(ToText(stats.sstable_count)).append("\n");
-    output.append("sstable_entries=").append(ToText(stats.sstable_entries)).append("\n");
+    output.append("memtable_entries=").append(resp::ToText(stats.memtable_entries)).append("\n");
+    output.append("immutable_entries=").append(resp::ToText(stats.immutable_entries)).append("\n");
+    output.append("sstable_files=").append(resp::ToText(stats.sstable_count)).append("\n");
+    output.append("sstable_entries=").append(resp::ToText(stats.sstable_entries)).append("\n");
     for (int level = 0; level < 4; ++level) {
-      output.append("level").append(ToText(static_cast<unsigned long long>(level)))
-          .append("_files=").append(ToText(stats.level_files[level])).append("\n");
-      output.append("level").append(ToText(static_cast<unsigned long long>(level)))
-          .append("_bytes=").append(ToText(stats.level_bytes[level])).append("\n");
+      output.append("level").append(resp::ToText(static_cast<unsigned long long>(level)))
+          .append("_files=").append(resp::ToText(stats.level_files[level])).append("\n");
+      output.append("level").append(resp::ToText(static_cast<unsigned long long>(level)))
+          .append("_bytes=").append(resp::ToText(stats.level_bytes[level])).append("\n");
     }
-    output.append("flush_count=").append(ToText(stats.flush_count)).append("\n");
-    output.append("compaction_count=").append(ToText(stats.compaction_count)).append("\n");
-    output.append("last_sequence=").append(ToText(stats.last_sequence)).append("\n");
-    output.append("puts=").append(ToText(stats.put_count)).append("\n");
-    output.append("gets=").append(ToText(stats.get_count)).append("\n");
-    output.append("deletes=").append(ToText(stats.delete_count)).append("\n");
+    output.append("flush_count=").append(resp::ToText(stats.flush_count)).append("\n");
+    output.append("compaction_count=").append(resp::ToText(stats.compaction_count)).append("\n");
+    output.append("last_sequence=").append(resp::ToText(stats.last_sequence)).append("\n");
+    output.append("puts=").append(resp::ToText(stats.put_count)).append("\n");
+    output.append("gets=").append(resp::ToText(stats.get_count)).append("\n");
+    output.append("deletes=").append(resp::ToText(stats.delete_count)).append("\n");
     return output;
   }
 
@@ -464,6 +788,9 @@ class Server {
   std::vector<std::thread> workers_;
   std::atomic<bool> stopping_;
   std::atomic<bool> shutdown_requested_;
+  std::atomic<unsigned long long> next_client_id_;
+  std::atomic<int> connected_clients_;
+  std::shared_mutex gate_;
   bool wsa_started_ = false;
 };
 
@@ -526,7 +853,8 @@ int main(int argc, char** argv) {
   }
   std::printf("[INFO] minidb server listening on 0.0.0.0:%d\n", config.port);
   std::printf("[INFO] data=%s workers=%d memtable=%sKB l0_trigger=%d\n", config.data_dir.c_str(),
-              config.workers, ToText(config.memtable_bytes / 1024).c_str(), config.l0_trigger);
+              config.workers, resp::ToText(config.memtable_bytes / 1024).c_str(),
+              config.l0_trigger);
   std::fflush(stdout);
 
   server.Run();

@@ -88,7 +88,7 @@ void RunClient(const Config& config, int index, int operations, ClientResult* re
 
     if (action < 70) {
       std::string value = Value(key_index, index, operation);
-      if (!connection.SendLine("PUT " + key + " " + value)) {
+      if (!connection.SendCommand({"SET", key, value})) {
         ++result->failures;
         break;
       }
@@ -100,7 +100,7 @@ void RunClient(const Config& config, int index, int operations, ClientResult* re
       result->model[key] = value;
       ++result->puts;
     } else if (action < 90) {
-      if (!connection.SendLine("GET " + key)) {
+      if (!connection.SendCommand({"GET", key})) {
         ++result->failures;
         break;
       }
@@ -117,7 +117,7 @@ void RunClient(const Config& config, int index, int operations, ClientResult* re
       }
       ++result->gets;
     } else {
-      if (!connection.SendLine("DEL " + key)) {
+      if (!connection.SendCommand({"DEL", key})) {
         ++result->failures;
         break;
       }
@@ -263,23 +263,23 @@ int main(int argc, char** argv) {
   probe.Connect(config.host, config.port, 5000);
   int protocol_failures = 0;
 
-  probe.SendLine("GET missing-key-for-network-test");
+  probe.SendCommand({"GET", "missing-key-for-network-test"});
   net::Response nil_response;
   if (!probe.ReadResponse(&nil_response) || !nil_response.IsNil()) ++protocol_failures;
 
-  probe.SendLine("BOGUS command");
+  probe.SendCommand({"BOGUS", "command"});
   net::Response error_response;
   if (!probe.ReadResponse(&error_response) || error_response.type != '-') ++protocol_failures;
 
-  probe.SendLine("GET");
+  probe.SendCommand({"GET"});
   net::Response arity_response;
   if (!probe.ReadResponse(&arity_response) || arity_response.type != '-') ++protocol_failures;
 
-  probe.SendLine("PING");
+  probe.SendCommand({"PING"});
   net::Response ping_response;
   if (!probe.ReadResponse(&ping_response) || ping_response.text != "PONG") ++protocol_failures;
 
-  probe.SendLine("STATS");
+  probe.SendCommand({"STATS"});
   net::Response stats_response;
   if (!probe.ReadResponse(&stats_response) ||
       stats_response.text.find("level0_files=") == std::string::npos ||
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
     ++protocol_failures;
   }
 
-  probe.SendLine("CHECK");
+  probe.SendCommand({"CHECK"});
   net::Response check_response;
   if (!probe.ReadResponse(&check_response) || check_response.type != '+') ++protocol_failures;
 
@@ -320,13 +320,13 @@ int main(int argc, char** argv) {
   std::printf("[INFO] server levels: %scompaction=%s\n", level_summary.c_str(),
               compaction_text.c_str());
 
-  probe.SendLine("PUT sentinel-key sentinel-value-20261127");
+  probe.SendCommand({"SET", "sentinel-key", "sentinel-value-20261127"});
   net::Response sentinel_response;
   if (!probe.ReadResponse(&sentinel_response) || sentinel_response.type != '+') {
     ++protocol_failures;
   }
 
-  probe.SendLine("LEVELS");
+  probe.SendCommand({"LEVELS"});
   net::Response levels_response;
   if (!probe.ReadResponse(&levels_response)) {
     ++protocol_failures;
@@ -366,17 +366,12 @@ int main(int argc, char** argv) {
   binary_value.push_back('\r');
   binary_value.push_back('\n');
   binary_value.push_back(static_cast<char>(0xff));
-  std::string binary_header =
-      "PUTB " + ToText(binary_key.size()) + " " + ToText(binary_value.size()) + "\r\n";
-  bool binary_ok = probe.SendRaw(binary_header.data(), binary_header.size()) &&
-                   probe.SendRaw(binary_key.data(), binary_key.size()) &&
-                   probe.SendRaw(binary_value.data(), binary_value.size()) &&
-                   probe.SendRaw("\r\n", 2);
   net::Response binary_put;
-  if (!binary_ok || !probe.ReadResponse(&binary_put) || binary_put.type != '+') {
+  if (!probe.SendCommand({"SET", binary_key, binary_value}) ||
+      !probe.ReadResponse(&binary_put) || binary_put.type != '+') {
     ++protocol_failures;
   }
-  probe.SendLine("GET " + binary_key);
+  probe.SendCommand({"GET", binary_key});
   net::Response binary_get;
   if (!probe.ReadResponse(&binary_get) || binary_get.type != '$' ||
       binary_get.text != binary_value) {
@@ -390,7 +385,7 @@ int main(int argc, char** argv) {
               static_cast<int>(model.size()), missing, mismatches);
   std::printf("[INFO] protocol checks failures=%d\n", protocol_failures);
 
-  probe.SendLine("SHUTDOWN");
+  probe.SendCommand({"SHUTDOWN"});
   net::Response shutdown_response;
   if (!probe.ReadResponse(&shutdown_response) || shutdown_response.type != '+') {
     ++protocol_failures;

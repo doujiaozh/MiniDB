@@ -9,8 +9,21 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace net {
+
+std::string EncodeLength(size_t value) {
+  char buffer[32];
+  int length = 0;
+  do {
+    buffer[length++] = static_cast<char>('0' + value % 10);
+    value /= 10;
+  } while (value > 0);
+  std::string result;
+  while (length > 0) result.push_back(buffer[--length]);
+  return result;
+}
 
 struct Response {
   char type;
@@ -101,6 +114,21 @@ class Connection {
     std::string data = line;
     data.append("\r\n");
     return SendAll(data.data(), data.size());
+  }
+
+  bool SendCommand(const std::vector<std::string>& parts) {
+    std::string encoded;
+    encoded.push_back('*');
+    encoded.append(EncodeLength(parts.size()));
+    encoded.append("\r\n");
+    for (size_t i = 0; i < parts.size(); ++i) {
+      encoded.push_back('$');
+      encoded.append(EncodeLength(parts[i].size()));
+      encoded.append("\r\n");
+      encoded.append(parts[i]);
+      encoded.append("\r\n");
+    }
+    return SendAll(encoded.data(), encoded.size());
   }
 
   bool SendRaw(const char* data, size_t size) { return SendAll(data, size); }
